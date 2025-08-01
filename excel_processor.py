@@ -4,20 +4,24 @@ import re
 from pathlib import Path
 
 def clean_dose_value(value):
-    """Remove units from dose values (e.g., '100 Gy' -> '100')"""
+    """Extract only numeric values from dose fields (e.g., '100 Gy' -> '100')"""
     if pd.isna(value) or value == '':
-        return value
+        return ''
     
-    # Convert to string and remove common units
+    # Convert to string and extract all numbers (including decimals)
     value_str = str(value).strip()
-    # Remove units like Gy, gr, Gray, etc. (case insensitive)
-    cleaned = re.sub(r'\s*(Gy|gr|Gray|kGy|rad)\s*$', '', value_str, flags=re.IGNORECASE)
     
-    try:
-        # Try to convert to float if it's a number
-        return float(cleaned) if cleaned else ''
-    except ValueError:
-        return cleaned
+    # Find all numeric values (including decimals)
+    numbers = re.findall(r'\d+\.?\d*', value_str)
+    
+    if numbers:
+        # Return the first number found
+        try:
+            return float(numbers[0]) if '.' in numbers[0] else int(numbers[0])
+        except ValueError:
+            return ''
+    
+    return ''
 
 def process_variety_names(variety_string):
     """Split variety names by common separators and clean them"""
@@ -93,20 +97,9 @@ def parse_address_field(address_str):
     parts = re.split(r'[,\n\r]+', address)
     parts = [p.strip() for p in parts if p.strip()]
     
-    # Extract organization name and type
+    # Extract names first (we need them to filter from organization name later)
     for part in parts:
-        part_lower = part.lower()
-        for keyword, org_type in org_keywords.items():
-            if keyword in part_lower:
-                result['Name of organization'] = part
-                result['Type of organization'] = org_type
-                break
-        if result['Name of organization']:
-            break
-    
-    # Extract names (assume first part might contain person name)
-    if parts:
-        first_part = parts[0]
+        first_part = part
         # Look for patterns like "Dr. John Smith" or "Smith, John"
         name_words = first_part.split()
         if len(name_words) >= 2:
@@ -119,6 +112,44 @@ def parse_address_field(address_str):
                 result['LastName'] = filtered_words[1]
             elif len(filtered_words) == 1:
                 result['LastName'] = filtered_words[0]
+        break  # Only process first part for names
+    
+    # Extract organization name and type
+    for part in parts:
+        part_lower = part.lower()
+        for keyword, org_type in org_keywords.items():
+            if keyword in part_lower:
+                # Remove titles, country names, and person names from organization name
+                org_name = part
+                titles = ['ph.d', 'phd', 'dr', 'dr.', 'mr', 'mr.', 'mrs', 'mrs.', 'ms', 'ms.', 'prof', 'prof.', 'professor', 'doctor']
+                countries = ['usa', 'united states', 'us', 'canada', 'uk', 'united kingdom', 'australia', 'germany', 'france', 'japan', 'china', 'india', 'brazil', 'russia', 'italy', 'spain', 'mexico', 'argentina', 'south africa', 'egypt', 'nigeria', 'kenya', 'ghana', 'morocco', 'algeria', 'tunisia', 'ethiopia', 'sudan', 'tanzania', 'uganda', 'zambia', 'zimbabwe', 'botswana', 'namibia', 'angola', 'mozambique', 'madagascar', 'mauritius', 'seychelles', 'thailand', 'vietnam', 'philippines', 'indonesia', 'malaysia', 'singapore', 'south korea', 'north korea', 'taiwan', 'hong kong', 'myanmar', 'cambodia', 'laos', 'bangladesh', 'pakistan', 'afghanistan', 'iran', 'iraq', 'turkey', 'israel', 'palestine', 'jordan', 'lebanon', 'syria', 'saudi arabia', 'uae', 'qatar', 'kuwait', 'oman', 'yemen', 'bahrain', 'nepal', 'bhutan', 'sri lanka', 'maldives', 'poland', 'czech republic', 'slovakia', 'hungary', 'romania', 'bulgaria', 'croatia', 'serbia', 'bosnia', 'montenegro', 'albania', 'greece', 'cyprus', 'malta', 'portugal', 'netherlands', 'belgium', 'luxembourg', 'switzerland', 'austria', 'denmark', 'sweden', 'norway', 'finland', 'iceland', 'ireland', 'estonia', 'latvia', 'lithuania', 'belarus', 'ukraine', 'moldova', 'georgia', 'armenia', 'azerbaijan', 'kazakhstan', 'uzbekistan', 'turkmenistan', 'kyrgyzstan', 'tajikistan', 'mongolia', 'chile', 'peru', 'ecuador', 'colombia', 'venezuela', 'bolivia', 'paraguay', 'uruguay', 'guyana', 'suriname', 'cuba', 'jamaica', 'haiti', 'dominican republic', 'puerto rico', 'trinidad', 'barbados', 'bahamas', 'belize', 'costa rica', 'panama', 'guatemala', 'honduras', 'el salvador', 'nicaragua', 'new zealand', 'fiji', 'papua new guinea', 'solomon islands', 'vanuatu', 'samoa', 'tonga', 'palau', 'micronesia', 'marshall islands', 'kiribati', 'tuvalu', 'nauru']
+                
+                # Get first/last names to exclude
+                first_name = result.get('FirstName', '').lower()
+                last_name = result.get('LastName', '').lower()
+                
+                words = org_name.split()
+                filtered_words = []
+                for word in words:
+                    word_clean = word.lower().strip('.,')
+                    if (word_clean not in titles and 
+                        word_clean not in countries and
+                        word_clean != first_name and 
+                        word_clean != last_name):
+                        # Also check if it's part of a multi-word country name
+                        skip_word = False
+                        for country in countries:
+                            if len(country.split()) > 1 and word_clean in country.split():
+                                skip_word = True
+                                break
+                        if not skip_word:
+                            filtered_words.append(word)
+                result['Name of organization'] = ' '.join(filtered_words).strip()
+                result['Type of organization'] = org_type
+                break
+        if result['Name of organization']:
+            break
+    
     
     # Extract address components
     address_parts = []
@@ -345,7 +376,7 @@ def process_excel_file(input_file, output_file=None):
                 
                 # Find Date Received column (flexible matching)
                 for col in df.columns:
-                    if 'date' in col.lower() and 'received' in col.lower():
+                    if 'date' in col.lower() and ('received' in col.lower() or 'recieved' in col.lower()):
                         date_received_col = col
                         break
                 
