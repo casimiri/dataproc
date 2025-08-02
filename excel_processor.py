@@ -1,7 +1,15 @@
 import pandas as pd
 import sys
 import re
+import os
+import time
+import json
 from pathlib import Path
+from openai import OpenAI
+from dotenv import load_dotenv
+
+# Load environment variables
+load_dotenv()
 
 def clean_dose_value(value):
     """Extract only numeric values from dose fields (e.g., '100 Gy' -> '100')"""
@@ -226,10 +234,151 @@ def process_dose_field(dose_str):
     
     return doses
 
-def get_latin_name(plant_name):
-    """Get Latin name based on common plant knowledge"""
+# OpenAI client initialization
+client = None
+if os.getenv('OPENAI_API_KEY'):
+    client = OpenAI(api_key=os.getenv('OPENAI_API_KEY'))
+
+def call_openai_with_retry(prompt, max_tokens=300, max_retries=3, delay=1):
+    """Call OpenAI API with retry logic and rate limiting"""
+    if not client:
+        print("Warning: OpenAI API key not found. Using fallback methods.")
+        return None
+    
+    for attempt in range(max_retries):
+        try:
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are an expert data analyst specializing in botanical and geographical information extraction. Analyze all provided data to extract accurate field values. Always respond with valid JSON only."},
+                    {"role": "user", "content": prompt}
+                ],
+                max_tokens=max_tokens,
+                temperature=0.1
+            )
+            return response.choices[0].message.content.strip()
+        except Exception as e:
+            print(f"OpenAI API call failed (attempt {attempt + 1}): {e}")
+            if attempt < max_retries - 1:
+                time.sleep(delay * (2 ** attempt))  # Exponential backoff
+            else:
+                print("All OpenAI API attempts failed. Using fallback methods.")
+                return None
+    return None
+
+def extract_all_fields_openai(row_data):
+    """Extract all output fields from complete row data using OpenAI API"""
+    if not row_data:
+        return {}
+    
+    # Convert row data to a readable format
+    row_text = "\n".join([f"{col}: {val}" for col, val in row_data.items() if not pd.isna(val) and val != ''])
+    
+    prompt = f"""Analyze this Excel row data and extract the following fields. Consider ALL the provided information to determine each field value accurately.
+
+Row Data:
+{row_text}
+
+Extract these fields and return as JSON:
+{{
+  "FirstName": "person's first name",
+  "LastName": "person's last name", 
+  "Phone": "phone number",
+  "Email": "email address",
+  "Name_of_organization": "organization/institution name",
+  "Type_of_organization": "Academic/Research/Government/Commercial/Non-profit",
+  "Street": "street address",
+  "POBox": "P.O. Box or BP if present",
+  "City": "city name",
+  "Country": "country name (standardized)",
+  "Treatment": "treatment type (GAMMA/ELECTRON/X-RAY/etc)",
+  "Common_Name_species": "common/vernacular name of plant",
+  "Latin_Name_species": "scientific/Latin name (Genus species)",
+  "Variety_Name_species": "variety/cultivar name",
+  "Type_species": "Seed/Cutting/Leaf/Root/Fruit/etc"
+}}
+
+Use empty strings for fields that cannot be determined. Be precise and use standard naming conventions."""
+    
+    response = call_openai_with_retry(prompt, max_tokens=500)
+    if response:
+        try:
+            # Clean response to ensure valid JSON
+            cleaned_response = response.strip()
+            if cleaned_response.startswith('```json'):
+                cleaned_response = cleaned_response[7:-3]
+            elif cleaned_response.startswith('```'):
+                cleaned_response = cleaned_response[3:-3]
+            
+            # Remove trailing commas that cause JSON parsing errors
+            import re
+            cleaned_response = re.sub(r',(\s*[}\\]])', r'\\1', cleaned_response)
+            # Also handle trailing comma at end of object
+            cleaned_response = re.sub(r',(\s*})', r'\\1', cleaned_response)
+            
+            data = json.loads(cleaned_response)
+            
+            # Standardize field names to match output format
+            standardized = {
+                'FirstName': data.get('FirstName', ''),
+                'LastName': data.get('LastName', ''),
+                'Phone': data.get('Phone', ''),
+                'Email': data.get('Email', ''),
+                'Name of organization': data.get('Name_of_organization', ''),
+                'Type of organization': data.get('Type_of_organization', ''),
+                'Street': data.get('Street', ''),
+                'POBox': data.get('POBox', ''),
+                'City': data.get('City', ''),
+                'Country': data.get('Country', ''),
+                'Treatment': data.get('Treatment', ''),
+                'Common Name species': data.get('Common_Name_species', ''),
+                'Latin Name species': data.get('Latin_Name_species', ''),
+                'Variety Name species': data.get('Variety_Name_species', ''),
+                'Type species': data.get('Type_species', '')
+            }
+            
+            return standardized
+        except json.JSONDecodeError as e:
+            print(f"JSON decode error: {e}")
+            print(f"Response was: {response}")
+    
+    return {}
+
+def get_plant_info_openai(plant_name, variety_name=''):
+    """Get plant information including Latin name and standardized common name using OpenAI API"""
     if pd.isna(plant_name) or plant_name == '':
-        return ''
+        return {'latin_name': '', 'common_name': '', 'variety_name': variety_name}
+    
+    plant_text = f"{plant_name} {variety_name}".strip()
+    
+    prompt = f"""Identify this plant and provide botanical information. Return only a JSON object with these keys:
+- 'latin_name': The scientific/Latin name (genus species)
+- 'common_name': The standardized common name
+- 'variety_name': The variety/cultivar name if mentioned
+
+Plant: {plant_text}
+
+If any information cannot be determined, use empty string for that field."""
+    
+    response = call_openai_with_retry(prompt)
+    if response:
+        try:
+            data = json.loads(response)
+            return {
+                'latin_name': data.get('latin_name', ''),
+                'common_name': data.get('common_name', ''),
+                'variety_name': data.get('variety_name', variety_name)
+            }
+        except json.JSONDecodeError:
+            pass
+    
+    # Fallback to original hardcoded method
+    return get_latin_name_fallback(plant_name, variety_name)
+
+def get_latin_name_fallback(plant_name, variety_name=''):
+    """Fallback method for getting Latin name based on common plant knowledge"""
+    if pd.isna(plant_name) or plant_name == '':
+        return {'latin_name': '', 'common_name': '', 'variety_name': variety_name}
     
     plant_lower = str(plant_name).lower()
     
@@ -282,9 +431,18 @@ def get_latin_name(plant_name):
     # Check for exact matches first
     for common_name, latin_name in latin_mapping.items():
         if common_name in plant_lower:
-            return latin_name
+            return {
+                'latin_name': latin_name,
+                'common_name': common_name.title(),
+                'variety_name': variety_name
+            }
     
-    return ''
+    return {'latin_name': '', 'common_name': plant_name, 'variety_name': variety_name}
+
+def get_latin_name(plant_name):
+    """Legacy function for backward compatibility"""
+    result = get_plant_info_openai(plant_name)
+    return result['latin_name']
 
 def classify_species_type(plant_name, material_name=''):
     """Classify the type of species (Seed, Cutting, etc.)"""
@@ -354,6 +512,9 @@ def process_excel_file(input_file, output_file=None):
         processed_rows = []
         
         for _, row in df.iterrows():
+            # Convert row to dictionary for AI processing
+            row_dict = row.to_dict()
+            
             # Get varieties from Material column and split them
             material_col = None
             for col in df.columns:
@@ -370,67 +531,115 @@ def process_excel_file(input_file, output_file=None):
             for variety in varieties:
                 new_row = {}
                 
-                # Basic field mappings - handle flexible column name matching
-                date_received_col = None
-                entry_no_col = None
+                # Use AI to extract all fields from complete row data
+                ai_extracted = extract_all_fields_openai(row_dict)
                 
-                # Find Date Received column (flexible matching)
-                for col in df.columns:
-                    if 'date' in col.lower() and ('received' in col.lower() or 'recieved' in col.lower()):
-                        date_received_col = col
-                        break
+                if ai_extracted:
+                    # Use AI-extracted data as primary source
+                    new_row.update(ai_extracted)
+                    
+                    # Override variety name with current variety being processed
+                    if variety and variety.strip():
+                        new_row['Variety Name species'] = variety
+                else:
+                    # Fallback to original parsing if AI fails
+                    print(f"AI extraction failed for row, using fallback methods...")
+                    
+                    # Basic field mappings - handle flexible column name matching
+                    date_received_col = None
+                    entry_no_col = None
+                    
+                    # Find Date Received column (flexible matching)
+                    for col in df.columns:
+                        if 'date' in col.lower() and ('received' in col.lower() or 'recieved' in col.lower()):
+                            date_received_col = col
+                            break
+                    
+                    # Find Entry No column (flexible matching)
+                    for col in df.columns:
+                        if 'entry' in col.lower() and 'no' in col.lower():
+                            entry_no_col = col
+                            break
+                        elif col.lower().strip() in ['entry no', 'entryno', 'entry_no', 'id', 'entry id']:
+                            entry_no_col = col
+                            break
+                    
+                    if date_received_col:
+                        new_row['DateReceived'] = row[date_received_col]
+                    if entry_no_col:
+                        new_row['IDAssigned'] = row[entry_no_col]
+                    
+                    # Address parsing for names, contact info, organization, location
+                    address_col = None
+                    for col in df.columns:
+                        if 'address' in col.lower():
+                            address_col = col
+                            break
+                    
+                    if address_col:
+                        address_data = parse_address_field(row[address_col])
+                        new_row.update(address_data)
+                    
+                    # Plant and variety information
+                    plant_name_col = None
+                    for col in df.columns:
+                        if 'plant' in col.lower() and 'name' in col.lower():
+                            plant_name_col = col
+                            break
+                    
+                    if plant_name_col:
+                        plant_name = row[plant_name_col]
+                        plant_info = get_plant_info_openai(plant_name, variety)
+                        new_row['Common Name species'] = plant_info['common_name'] or plant_name
+                        new_row['Latin Name species'] = plant_info['latin_name']
+                        new_row['Type species'] = classify_species_type(plant_name, variety)
+                    
+                    new_row['Variety Name species'] = variety
+                    
+                    # Dose and treatment information
+                    dose_col = None
+                    for col in df.columns:
+                        if 'dose' in col.lower():
+                            dose_col = col
+                            break
+                    
+                    if dose_col:
+                        dose_data = process_dose_field(row[dose_col])
+                        new_row.update(dose_data)
+                        new_row['Treatment'] = extract_treatment_type(row[dose_col])
                 
-                # Find Entry No column (flexible matching)
-                for col in df.columns:
-                    if 'entry' in col.lower() and 'no' in col.lower():
-                        entry_no_col = col
-                        break
-                    elif col.lower().strip() in ['entry no', 'entryno', 'entry_no', 'id', 'entry id']:
-                        entry_no_col = col
-                        break
+                # Always add DateReceived and IDAssigned from original columns if not set by AI
+                if not new_row.get('DateReceived'):
+                    date_received_col = None
+                    for col in df.columns:
+                        if 'date' in col.lower() and ('received' in col.lower() or 'recieved' in col.lower()):
+                            date_received_col = col
+                            break
+                    if date_received_col:
+                        new_row['DateReceived'] = row[date_received_col]
                 
-                if date_received_col:
-                    new_row['DateReceived'] = row[date_received_col]
-                if entry_no_col:
-                    new_row['IDAssigned'] = row[entry_no_col]
+                if not new_row.get('IDAssigned'):
+                    entry_no_col = None
+                    for col in df.columns:
+                        if 'entry' in col.lower() and 'no' in col.lower():
+                            entry_no_col = col
+                            break
+                        elif col.lower().strip() in ['entry no', 'entryno', 'entry_no', 'id', 'entry id']:
+                            entry_no_col = col
+                            break
+                    if entry_no_col:
+                        new_row['IDAssigned'] = row[entry_no_col]
                 
-                # Address parsing for names, contact info, organization, location
-                address_col = None
-                for col in df.columns:
-                    if 'address' in col.lower():
-                        address_col = col
-                        break
-                
-                if address_col:
-                    address_data = parse_address_field(row[address_col])
-                    new_row.update(address_data)
-                
-                # Plant and variety information
-                plant_name_col = None
-                for col in df.columns:
-                    if 'plant' in col.lower() and 'name' in col.lower():
-                        plant_name_col = col
-                        break
-                
-                if plant_name_col:
-                    plant_name = row[plant_name_col]
-                    new_row['Common Name species'] = plant_name
-                    new_row['Latin Name species'] = get_latin_name(plant_name)
-                    new_row['Type species'] = classify_species_type(plant_name, variety)
-                
-                new_row['Variety Name species'] = variety
-                
-                # Dose and treatment information
-                dose_col = None
-                for col in df.columns:
-                    if 'dose' in col.lower():
-                        dose_col = col
-                        break
-                
-                if dose_col:
-                    dose_data = process_dose_field(row[dose_col])
-                    new_row.update(dose_data)
-                    new_row['Treatment'] = extract_treatment_type(row[dose_col])
+                # Process dose fields if not handled by AI
+                if not any(new_row.get(f'dose {i}') for i in range(1, 11)):
+                    dose_col = None
+                    for col in df.columns:
+                        if 'dose' in col.lower():
+                            dose_col = col
+                            break
+                    if dose_col:
+                        dose_data = process_dose_field(row[dose_col])
+                        new_row.update(dose_data)
                 
                 processed_rows.append(new_row)
         
