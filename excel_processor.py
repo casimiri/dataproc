@@ -11,6 +11,30 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+def format_date_received(date_value):
+    """Format date to YYYY.MM.DD format"""
+    if pd.isna(date_value) or date_value == '':
+        return ''
+    
+    try:
+        # Handle various date formats
+        if isinstance(date_value, pd.Timestamp):
+            return date_value.strftime('%Y.%m.%d')
+        elif isinstance(date_value, str):
+            # Try to parse string dates
+            date_obj = pd.to_datetime(date_value, errors='coerce')
+            if not pd.isna(date_obj):
+                return date_obj.strftime('%Y.%m.%d')
+        else:
+            # Try to convert other types to datetime
+            date_obj = pd.to_datetime(date_value, errors='coerce')
+            if not pd.isna(date_obj):
+                return date_obj.strftime('%Y.%m.%d')
+    except:
+        pass
+    
+    return str(date_value)  # Return original if formatting fails
+
 def clean_dose_value(value):
     """Extract only numeric values from dose fields (e.g., '100 Gy' -> '100')"""
     if pd.isna(value) or value == '':
@@ -565,7 +589,7 @@ def process_excel_file(input_file, output_file=None):
                             break
                     
                     if date_received_col:
-                        new_row['DateReceived'] = row[date_received_col]
+                        new_row['DateReceived'] = format_date_received(row[date_received_col])
                     if entry_no_col:
                         new_row['IDAssigned'] = row[entry_no_col]
                     
@@ -616,7 +640,7 @@ def process_excel_file(input_file, output_file=None):
                             date_received_col = col
                             break
                     if date_received_col:
-                        new_row['DateReceived'] = row[date_received_col]
+                        new_row['DateReceived'] = format_date_received(row[date_received_col])
                 
                 if not new_row.get('IDAssigned'):
                     entry_no_col = None
